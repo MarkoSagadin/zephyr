@@ -1,0 +1,7 @@
+- connected: true
+  id: 001050795550
+  platform: nrf7002dk/nrf5340/cpuapp
+  product: J-Link
+  rtt_runner: jlink
+  runner: nrfutil
+  use_rtt: true

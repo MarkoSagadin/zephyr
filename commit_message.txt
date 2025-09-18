@@ -1,0 +1,36 @@
+drivers: spi: enhance spi shell
+
+This commit enhances the SPI shell in a number of different ways:
+- Previosly only spi buses could be specifed as a spi device at the command
+line. Now both spi buses and spi devices (physical device on the spi bus, not
+the device struct) can be specified.
+- Both spi buses and spi devices can be specified by their node name or by any of
+their node labels.
+- Instead of having a single instance of a spi config struct, each spi bus and
+spi device has it's own dedicated config, stored inside the added spi_thing
+struct abstraction as spi_dt_spec. This means that user only has to configure
+spi config once for each device and use them freely, without needing to
+reconfigure them every time after switching between different spi devices.
+- Spi devices get their spi configs automatically from the devicetree at compile time. This means
+  that once a good working configuration is found for a spi device, that can be specified as a
+  "default" in the devicetree.
+- Spi devices don't need to have their status set to "okay" or be initialized by their driver to be
+  accessible from the spi shell. As long as the spi bus that they are on has statis="okay", they can
+  be accessed.
+- When changing a cs pin with cs, the spi device/bus needs to first be specified before specifying
+  the gpio device. The tab completion will help users to autocomplete both of the arguments.
+
+
+Implementation details
+
+- It was possible to gather all the information about the spi devices from the devicetree at the compile
+  time, but not for the spi buses. For the spi devices we have a way to filter out all "spi device
+  nodes that are on an okay spi bus" with a devicetree macros and extract some data from those
+  nodes. For the spi buses that is not possible, since there is not compile time check to filter out
+  non-spi bus nodes.
+- So, fof the spi buses this discovery step has to be done at the runtime, with the help of SYS_INIT
+  macro and shell_device_filter function.
+- Since we now allow users to either specifiy a spi bus or a spi device by their node label or their
+  node name, we needed to have a way to map those strings to the correct spi config struct, so we
+  can later pass it to the spi API functions or do some configuration on it. That work is done by
+  the find_spec_by_label and the two arrays, spi_things and maps.

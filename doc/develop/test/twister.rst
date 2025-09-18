@@ -1443,6 +1443,18 @@ work. It is equivalent to following west and twister commands.
   manually according to above example. This is because the serial port
   of the PTY is not fixed and being allocated in the system at runtime.
 
+RTT support using ``--device-rtt``  can also be used in the
+hardware map:
+
+.. code-block:: yaml
+   - connected: true
+     id: 001050795550
+     platform: nrf7002dk/nrf5340/cpuapp
+     product: J-Link
+     rtt_runner: jlink
+     runner: nrfutil
+     use_rtt: true
+
 If west is not available or does not know how to flash your system, a custom
 flash command can be specified using the ``flash-command`` flag. The script is
 called with a ``--build-dir`` with the path of the current build, as well as a

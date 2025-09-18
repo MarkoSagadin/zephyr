@@ -1932,7 +1932,7 @@ class TwisterRunner:
                 instance.run = False
 
             no_retry_statuses = [
-                TwisterStatus.PASS,
+                # TwisterStatus.PASS,
                 TwisterStatus.SKIP,
                 TwisterStatus.FILTER,
                 TwisterStatus.NOTRUN

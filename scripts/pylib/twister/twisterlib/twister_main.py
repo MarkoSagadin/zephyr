@@ -23,6 +23,11 @@ from twisterlib.statuses import TwisterStatus
 from twisterlib.testplan import TestPlan
 
 
+def lprint(msg):
+    WARNING = '\033[93m'
+    ENDC = '\033[0m'
+    print(f"{WARNING}--> {msg}{ENDC}")
+
 def init_color(colorama_strip):
     colorama.init(strip=colorama_strip)
 
