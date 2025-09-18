@@ -965,20 +965,56 @@ class ZephyrBinaryRunner(abc.ABC):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((host, port))
 
-        # Otherwise, use a pure python implementation. This will work well for logging,
-        # but input is line based only.
+        # Otherwise, use a pure python implementation.
         sel = selectors.DefaultSelector()
         sel.register(sys.stdin, selectors.EVENT_READ)
         sel.register(sock, selectors.EVENT_READ)
+
+
+        if platform.system() == 'Windows':
+            self._windows_telnet_client(sock, sel)
+        else:
+            self._unix_telnet_client(sock, sel)
+
+
+    def _unix_telnet_client(self, sock: socket.socket, sel: selectors.DefaultSelector) -> None:
+
+        import tty
+        # Enable cbreak mode on the keyboard input, that way all shell editing commands
+        # (arrow keys, backspace, etc.) work as expected.
+        fd = sys.stdin.fileno()
+        tty.setcbreak(fd)
         while True:
             events = sel.select()
             for key, _ in events:
                 if key.fileobj == sys.stdin:
-                    text = sys.stdin.readline()
-                    if text:
-                        sock.send(text.encode())
+                    data = os.read(fd, 2048)
+                    if data:
+                        sock.send(data)
 
                 elif key.fileobj == sock:
                     resp = sock.recv(2048)
                     if resp:
-                        print(resp.decode(), end='')
+                        print(resp.decode(), end='', flush=True)
+
+    def _windows_telnet_client(self, sock: socket.socket, sel: selectors.DefaultSelector) -> None:
+        import msvcrt
+
+        # On Windows we can’t use selectors for keyboard input,
+        # so we poll for key presses with msvcrt.
+        while True:
+            # 1. Handle socket events (incoming data)
+            events = sel.select(timeout=0)  # non-blocking wait
+            for key, _ in events:
+                if key.fileobj == sock:
+                    resp = sock.recv(2048)
+                    if resp:
+                        print(resp.decode(), end='', flush=True)
+
+            # 2. Handle keyboard input (outgoing data)
+            while msvcrt.kbhit():  # check if a key was pressed
+                ch = msvcrt.getch()  # returns a single byte
+                if ch == b'\r':      # normalize CR to CRLF
+                    sock.send(b"\r\n")
+                else:
+                    sock.send(ch)
