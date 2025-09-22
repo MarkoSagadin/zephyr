@@ -26,6 +26,8 @@ class DeviceConfig:
     baud: int = 115200
     runner: str = ''
     runner_params: list[str] = field(default_factory=list, repr=False)
+    rtt_runner: str = ''
+    use_rtt: bool = False
     id: str = ''
     product: str = ''
     serial_pty: str = ''
@@ -78,6 +80,8 @@ class TwisterHarnessConfig:
             baud=config.option.device_serial_baud,
             runner=config.option.runner,
             runner_params=runner_params,
+            rtt_runner=config.option.runner,
+            use_rtt=config.option.device_rtt,
             id=config.option.device_id,
             product=config.option.device_product,
             serial_pty=config.option.device_serial_pty,
