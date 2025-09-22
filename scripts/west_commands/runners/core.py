@@ -13,6 +13,7 @@ as well as some other helpers for concrete runner classes.
 
 import abc
 import argparse
+import contextlib
 import errno
 import logging
 import os
@@ -1028,20 +1029,165 @@ class ZephyrBinaryRunner(abc.ABC):
             # Send the given string before entering the interactive mode
             sock.sendall(send_on_connect.encode('ascii'))
 
-        # Otherwise, use a pure python implementation. This will work well for logging,
-        # but input is line based only.
+        if platform.system() == 'Windows':
+            self._windows_telnet_client(sock)
+        else:
+            self._unix_telnet_client(sock)
+
+
+    def _unix_telnet_client(self, sock: socket.socket) -> None:
+        """
+        Start a telnet client on Unix.
+
+        Selectors are used to register both the given socket and the stdin and wait on
+        incoming data, to later process it.
+        """
+        import termios
+        import tty
+
         sel = selectors.DefaultSelector()
         sel.register(sys.stdin, selectors.EVENT_READ)
         sel.register(sock, selectors.EVENT_READ)
-        while True:
-            events = sel.select()
-            for key, _ in events:
-                if key.fileobj == sys.stdin:
-                    text = sys.stdin.readline()
-                    if text:
-                        sock.send(text.encode())
 
-                elif key.fileobj == sock:
+
+        # We can't type check functions from tty and termios on Windows operating
+        # systems: mypy thinks the modules have no such attributes.
+        fd = sys.stdin.fileno()
+        orig_attr = termios.tcgetattr(fd) # type: ignore
+        try:
+            # Enable cbreak mode on the keyboard input, that way all shell editing
+            # commands (arrow keys, backspace, etc.) work as expected.
+            tty.setcbreak(fd) # type: ignore
+            while True:
+                events = sel.select()
+                for key, _ in events:
+                    if key.fileobj == sys.stdin:
+                        data = os.read(fd, 2048)
+                        if data:
+                            sock.send(data)
+
+                    elif key.fileobj == sock:
+                        resp = sock.recv(2048)
+                        if resp:
+                            print(resp.decode(), end='', flush=True)
+        except OSError as e:
+            print("\n\nCommunication was closed, reason:", e)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, orig_attr) # type: ignore
+
+
+    def _windows_telnet_client(self, sock):
+        """
+        Start a telnet client on Windows.
+
+        Since selectors do not support stdin on Windows, two threads are used:
+        - One reads keyboard input from stdin and forwards it to the socket.
+        - The other reads data from the socket and prints it to the screen.
+
+        ENABLE_VIRTUAL_TERMINAL_INPUT is enabled on the stdin console handle so
+        that Windows translates special keys (arrows, F-keys, navigation keys,
+        etc.) into standard ANSI/xterm escape sequences automatically, without
+        needing a manual key-code translation table. The original console mode
+        is restored when the session ends.
+
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING is also enabled on the stdout handle
+        so that ANSI escape sequences received from the target (colours, cursor
+        movement, etc.) are rendered correctly.
+        """
+        import ctypes
+        import threading
+        from ctypes import byref, c_ulong
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        # Console mode flag constants
+        ENABLE_PROCESSED_INPUT             = 0x0001
+        ENABLE_LINE_INPUT                  = 0x0002
+        ENABLE_ECHO_INPUT                  = 0x0004
+        ENABLE_VIRTUAL_TERMINAL_INPUT      = 0x0200
+        ENABLE_PROCESSED_OUTPUT            = 0x0001
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        stdin  = kernel32.GetStdHandle(-10)
+        stdout = kernel32.GetStdHandle(-11)
+
+        old_in_mode= c_ulong(0)
+        old_out_mode = c_ulong(0)
+        kernel32.GetConsoleMode(stdin,  byref(old_in_mode))
+        kernel32.GetConsoleMode(stdout, byref(old_out_mode))
+
+        # Enable raw VT input: turn on VT translation and PROCESSED_INPUT,
+        # turn off LINE and ECHO so os.read() returns each character immediately.
+        in_mode = (
+            (old_in_mode.value | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_PROCESSED_INPUT)
+            & ~ENABLE_LINE_INPUT
+            & ~ENABLE_ECHO_INPUT
+        )
+        kernel32.SetConsoleMode(stdin, in_mode)
+
+        # Enable VT output processing so ANSI sequences from the target render
+        # correctly.
+        out_mode = (old_out_mode.value
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        )
+        kernel32.SetConsoleMode(stdout, out_mode)
+
+        def send_keyboard_input(sock: socket.socket,
+                                stop: threading.Event,
+                                err: threading.Event):
+            stdin_fd = sys.stdin.fileno()
+
+            try:
+                while not stop.is_set():
+                    data = os.read(stdin_fd, 2048)
+                    if data and not stop.is_set():
+                        sock.sendall(data)
+            except OSError as e:
+                if not err.is_set() and not stop.is_set():
+                    err.set()
+                    print("\n\nCommunication was closed, reason:", e)
+                stop.set()
+
+        def receive_rtt_data(sock: socket.socket,
+                            stop: threading.Event,
+                            err: threading.Event):
+            try:
+                while not stop.is_set():
                     resp = sock.recv(2048)
-                    if resp:
-                        print(resp.decode(), end='')
+                    if not resp:
+                        print("\n\nConnection closed by the remote host, exiting!")
+                        stop.set()
+                        break
+                    print(resp.decode(errors="replace"), end='', flush=True)
+            except OSError as e:
+                if not err.is_set() and not stop.is_set():
+                    err.set()
+                    print("\n\nCommunication was closed, reason:", e)
+                stop.set()
+
+        stop = threading.Event()
+        err  = threading.Event()
+
+        # Mark the keyboard thread as a daemon so it does not prevent the
+        # process from exiting if it is still blocked in os.read() after the
+        # socket has been closed.
+        kb_thread = threading.Thread(target=send_keyboard_input,
+                                     args=(sock, stop, err), daemon=True)
+        rx_thread = threading.Thread(target=receive_rtt_data,
+                                     args=(sock, stop, err))
+        kb_thread.start()
+        rx_thread.start()
+
+        try:
+            while not stop.is_set():
+                # Wait for an event in the loop. Without timeout the
+                # KeyboardInterrupt would not be detected.
+                stop.wait(timeout=0.1)
+        except KeyboardInterrupt:
+            stop.set()
+        finally:
+            kernel32.SetConsoleMode(stdin,  old_in_mode.value)
+            kernel32.SetConsoleMode(stdout, old_out_mode.value)
+            with contextlib.suppress(OSError):
+                sock.close()
