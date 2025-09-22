@@ -13,12 +13,13 @@ as well as some other helpers for concrete runner classes.
 
 import abc
 import argparse
+import asyncio
+import contextlib
 import errno
 import logging
 import os
 import platform
 import re
-import selectors
 import shlex
 import shutil
 import signal
@@ -1028,20 +1029,134 @@ class ZephyrBinaryRunner(abc.ABC):
             # Send the given string before entering the interactive mode
             sock.sendall(send_on_connect.encode('ascii'))
 
-        # Otherwise, use a pure python implementation. This will work well for logging,
-        # but input is line based only.
-        sel = selectors.DefaultSelector()
-        sel.register(sys.stdin, selectors.EVENT_READ)
-        sel.register(sock, selectors.EVENT_READ)
-        while True:
-            events = sel.select()
-            for key, _ in events:
-                if key.fileobj == sys.stdin:
-                    text = sys.stdin.readline()
-                    if text:
-                        sock.send(text.encode())
+        if platform.system() == 'Windows':
+            with self._windows_vt_console_mode():
+                self._run_async_telnet_client(sock)
+        else:
+            with self._unix_stdin_cbreak_mode():
+                self._run_async_telnet_client(sock)
 
-                elif key.fileobj == sock:
-                    resp = sock.recv(2048)
-                    if resp:
-                        print(resp.decode(), end='')
+    @contextlib.contextmanager
+    def _unix_stdin_cbreak_mode(self):
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        orig_attr = termios.tcgetattr(fd)  # type: ignore
+        try:
+            # Enable cbreak mode on the keyboard input, that way all shell editing
+            # commands (arrow keys, backspace, etc.) work as expected.
+            tty.setcbreak(fd)  # type: ignore
+            yield
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, orig_attr)  # type: ignore
+
+    @contextlib.contextmanager
+    def _windows_vt_console_mode(self):
+        import ctypes
+        from ctypes import byref, c_ulong
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        # Console mode flag constants
+        ENABLE_PROCESSED_INPUT             = 0x0001
+        ENABLE_LINE_INPUT                  = 0x0002
+        ENABLE_ECHO_INPUT                  = 0x0004
+        ENABLE_VIRTUAL_TERMINAL_INPUT      = 0x0200
+        ENABLE_PROCESSED_OUTPUT            = 0x0001
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        stdin = kernel32.GetStdHandle(-10)
+        stdout = kernel32.GetStdHandle(-11)
+
+        old_in_mode = c_ulong(0)
+        old_out_mode = c_ulong(0)
+        kernel32.GetConsoleMode(stdin, byref(old_in_mode))
+        kernel32.GetConsoleMode(stdout, byref(old_out_mode))
+
+        # Enable raw VT input: turn on VT translation and PROCESSED_INPUT,
+        # turn off LINE and ECHO so os.read() returns each character immediately.
+        in_mode = (
+            (old_in_mode.value | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_PROCESSED_INPUT)
+            & ~ENABLE_LINE_INPUT
+            & ~ENABLE_ECHO_INPUT
+        )
+        kernel32.SetConsoleMode(stdin, in_mode)
+
+        # Enable VT output processing so ANSI sequences from the target render
+        # correctly.
+        out_mode = (
+            old_out_mode.value
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        )
+        kernel32.SetConsoleMode(stdout, out_mode)
+
+        try:
+            yield
+        finally:
+            kernel32.SetConsoleMode(stdin, old_in_mode.value)
+            kernel32.SetConsoleMode(stdout, old_out_mode.value)
+
+    def _run_async_telnet_client(self, sock: socket.socket) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._async_telnet_client(sock))
+        except KeyboardInterrupt:
+            with contextlib.suppress(OSError):
+                sock.close()
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    async def _async_telnet_client(self, sock: socket.socket) -> None:
+        stop = asyncio.Event()
+        reported_error = False
+        stdin_fd = sys.stdin.fileno()
+        loop = asyncio.get_running_loop()
+
+        sock.setblocking(False)
+
+        async def send_keyboard_input() -> None:
+            nonlocal reported_error
+
+            try:
+                while not stop.is_set():
+                    data = await asyncio.to_thread(os.read, stdin_fd, 2048)
+                    if data and not stop.is_set():
+                        await loop.sock_sendall(sock, data)
+            except OSError as e:
+                if not reported_error and not stop.is_set():
+                    reported_error = True
+                    print('\n\nCommunication was closed, reason:', e)
+                stop.set()
+
+        async def receive_rtt_data() -> None:
+            nonlocal reported_error
+
+            try:
+                while not stop.is_set():
+                    resp = await loop.sock_recv(sock, 2048)
+                    if not resp:
+                        print('\n\nConnection closed by the remote host, exiting!')
+                        stop.set()
+                        break
+                    print(resp.decode(errors='replace'), end='', flush=True)
+            except OSError as e:
+                if not reported_error and not stop.is_set():
+                    reported_error = True
+                    print('\n\nCommunication was closed, reason:', e)
+                stop.set()
+
+        send_task = asyncio.create_task(send_keyboard_input())
+        recv_task = asyncio.create_task(receive_rtt_data())
+
+        try:
+            await stop.wait()
+        finally:
+            send_task.cancel()
+            recv_task.cancel()
+            await asyncio.gather(send_task, recv_task, return_exceptions=True)
+            with contextlib.suppress(OSError):
+                sock.close()
