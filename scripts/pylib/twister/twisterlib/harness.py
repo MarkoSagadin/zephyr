@@ -459,6 +459,12 @@ class Pytest(Harness):
         if options.west_runner:
             self.pytest_params.runner = options.west_runner
 
+        if options.use_rtt:
+            self.pytest_params.device_rtt = options.use_rtt
+
+        if options.rtt_runner:
+            self.pytest_params.rtt_runner = options.rtt_runner
+
         if options.west_flash and options.west_flash != []:
             self.pytest_params.west_flash_extra_args = str(options.west_flash)
 
